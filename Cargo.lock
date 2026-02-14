@@ -1828,6 +1828,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
+name = "logindex"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "parking_lot",
+ "rust-rocksdb",
+ "storage",
+ "tempfile",
+]
+
+[[package]]
 name = "loom"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2952,7 +2963,7 @@ dependencies = [
 [[package]]
 name = "rust-librocksdb-sys"
 version = "0.41.0+10.9.1"
-source = "git+https://github.com/zaidoon1/rust-rocksdb?branch=master#83aceef5fc372da2fd2dd78bac786a189742274f"
+source = "git+https://github.com/ruojieranyishen/zaidoon1-rust-rocksdb?branch=addtableproperties#f7abb18c64fac810f3c4736aef833c340396449b"
 dependencies = [
  "bindgen 0.72.1",
  "bzip2-sys",
@@ -2967,7 +2978,7 @@ dependencies = [
 [[package]]
 name = "rust-rocksdb"
 version = "0.45.0"
-source = "git+https://github.com/zaidoon1/rust-rocksdb?branch=master#83aceef5fc372da2fd2dd78bac786a189742274f"
+source = "git+https://github.com/ruojieranyishen/zaidoon1-rust-rocksdb?branch=addtableproperties#f7abb18c64fac810f3c4736aef833c340396449b"
 dependencies = [
  "libc",
  "parking_lot",
