@@ -94,7 +94,7 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
         }
 
         let count = self.count.fetch_add(1, Ordering::SeqCst);
-        if count % 10 == 0 {
+        if count.is_multiple_of(10) {
             (self.callback)(res.smallest_flushed_log_index, false);
         }
 

@@ -104,7 +104,7 @@ impl LogIndexOfColumnFamilies {
         let cf = self.cf.read();
 
         for i in 0..COLUMN_FAMILY_COUNT {
-            let skip = flush_cf.map_or(false, |fc| {
+            let skip = flush_cf.is_some_and(|fc| {
                 i != fc && cf[i].flushed_index.ge_seqno(&cf[i].applied_index)
             });
             if skip {
