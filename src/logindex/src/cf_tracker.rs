@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! LogIndexOfColumnFamilies: tracks applied_index / flushed_index for each CF
-
 use std::collections::BTreeSet;
 
 use parking_lot::RwLock;

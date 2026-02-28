@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! LogIndex module: maintains the mapping between Raft LogIndex and SequenceNumber on top of RocksDB.
-
 pub mod cf_tracker;
 pub mod collector;
 pub mod db_access;

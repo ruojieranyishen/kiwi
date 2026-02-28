@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! LogIndexAndSequenceCollectorPurger: EventListener, updates state on OnFlushCompleted
-
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use rocksdb::event_listener::{EventListener, FlushJobInfo};

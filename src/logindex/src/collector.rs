@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! LogIndexAndSequenceCollector: ordered (log_index, seqno) mapping queue
-
 use crate::types::{LogIndex, LogIndexAndSequencePair, SequenceNumber};
 use parking_lot::RwLock;
 use std::collections::VecDeque;

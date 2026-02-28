@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! LogIndexTablePropertiesCollector: writes log_index/seqno to user_collected_properties during SST construction
-
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;

@@ -15,8 +15,6 @@
 // See the License for the language governing permissions and
 // limitations under the License.
 
-//! Thin wrapper interface: for LogIndexOfColumnFamilies::Init
-
 use rocksdb::table_properties::TablePropertiesCollection;
 
 /// Error type (reuse rocksdb::Error or custom)
