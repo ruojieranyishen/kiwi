@@ -129,6 +129,11 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
         }
         let target_cf = res.smallest_flushed_log_index_cf as usize;
 
+        let Some(ref trigger) = self.flush_trigger else {
+            return;
+        };
+
+        // Attempt to claim manual-flush state; abort if another flush is already in progress
         if self
             .manual_flushing_cf
             .compare_exchange(-1, target_cf as i64, Ordering::SeqCst, Ordering::SeqCst)
@@ -137,10 +142,8 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
             return;
         }
 
-        if let Some(ref trigger) = self.flush_trigger {
-            if target_cf < COLUMN_FAMILY_COUNT {
-                trigger(target_cf);
-            }
+        if target_cf < COLUMN_FAMILY_COUNT {
+            trigger(target_cf);
         }
     }
 }

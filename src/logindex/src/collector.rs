@@ -54,10 +54,10 @@ impl LogIndexAndSequenceCollector {
     ///
     /// When step_length_bit=0, full sampling; when >0, sample at 2^bit intervals to save memory
     pub fn new(step_length_bit: u8) -> Self {
-        let step_length_mask = if step_length_bit == 0 {
-            0
-        } else {
-            (1u64 << step_length_bit) - 1
+        let step_length_mask = match step_length_bit {
+            0 => 0,
+            1..=63 => (1u64 << step_length_bit) - 1,
+            _ => u64::MAX,
         };
         Self {
             step_length_mask,

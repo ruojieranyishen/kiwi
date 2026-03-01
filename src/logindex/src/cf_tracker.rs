@@ -94,6 +94,10 @@ impl Default for LogIndexOfColumnFamilies {
 }
 
 impl LogIndexOfColumnFamilies {
+    fn is_valid_cf_id(cf_id: usize) -> bool {
+        cf_id < COLUMN_FAMILY_COUNT
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -145,6 +149,9 @@ impl LogIndexOfColumnFamilies {
     }
 
     pub fn set_flushed_log_index(&self, cf_id: usize, log_index: LogIndex, seqno: SequenceNumber) {
+        if !Self::is_valid_cf_id(cf_id) {
+            return;
+        }
         let cf = self.cf.write();
         let li = cf[cf_id].flushed_index.log_index();
         let seq = cf[cf_id].flushed_index.seqno();
@@ -173,11 +180,17 @@ impl LogIndexOfColumnFamilies {
 
     /// Whether cur_log_index has been applied (less than applied)
     pub fn is_applied(&self, cf_id: usize, cur_log_index: LogIndex) -> bool {
+        if !Self::is_valid_cf_id(cf_id) {
+            return false;
+        }
         cur_log_index < self.cf.read()[cf_id].applied_index.log_index()
     }
 
     /// Update applied_index on write; if flushed==applied, also update flushed
     pub fn update(&self, cf_id: usize, cur_log_index: LogIndex, cur_seqno: SequenceNumber) {
+        if !Self::is_valid_cf_id(cf_id) {
+            return;
+        }
         let cf = self.cf.write();
         if cf[cf_id].flushed_index.le_seqno(&self.last_flush_index)
             && cf[cf_id].flushed_index.eq_seqno(&cf[cf_id].applied_index)
@@ -232,6 +245,9 @@ impl LogIndexOfColumnFamilies {
     /// Get state of specified CF (for testing or debugging)
     #[allow(dead_code)]
     pub fn get_cf_applied(&self, cf_id: usize) -> (LogIndex, SequenceNumber) {
+        if !Self::is_valid_cf_id(cf_id) {
+            return (0, 0);
+        }
         let cf = self.cf.read();
         (
             cf[cf_id].applied_index.log_index(),
@@ -241,6 +257,9 @@ impl LogIndexOfColumnFamilies {
 
     #[allow(dead_code)]
     pub fn get_cf_flushed(&self, cf_id: usize) -> (LogIndex, SequenceNumber) {
+        if !Self::is_valid_cf_id(cf_id) {
+            return (0, 0);
+        }
         let cf = self.cf.read();
         (
             cf[cf_id].flushed_index.log_index(),
