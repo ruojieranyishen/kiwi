@@ -229,7 +229,7 @@ impl LogIndexOfColumnFamilies {
         }
         let first = *s.first().unwrap();
         let last = *s.last().unwrap();
-        (last - first) as u64
+        last.saturating_sub(first) as u64
     }
 
     pub fn set_last_flush_index(&self, log_index: LogIndex, seqno: SequenceNumber) {

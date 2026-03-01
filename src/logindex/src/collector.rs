@@ -91,11 +91,17 @@ impl LogIndexAndSequenceCollector {
     /// Append new mapping (with step_length_mask sampling)
     ///
     /// Only append when (log_index & step_length_mask) == 0
+    ///
+    /// Note: LogIndex is i64 but expected to be non-negative in practice.
+    /// Negative values will be skipped as they cast to large u64 values.
     pub fn update(
         &self,
         smallest_applied_log_index: LogIndex,
         smallest_flush_seqno: SequenceNumber,
     ) {
+        if smallest_applied_log_index < 0 {
+            return;
+        }
         if (smallest_applied_log_index as u64 & self.step_length_mask) != 0 {
             return;
         }

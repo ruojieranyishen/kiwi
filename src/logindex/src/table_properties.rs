@@ -151,6 +151,9 @@ pub fn read_stats_from_table_props(
     let mut parts = s.split('/');
     let log_index: LogIndex = parts.next()?.parse().ok()?;
     let seqno: SequenceNumber = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
     Some(LogIndexAndSequencePair::new(log_index, seqno))
 }
 
@@ -164,7 +167,9 @@ pub fn get_largest_log_index_from_collection(
     for (_, props) in collection.iter() {
         let user_props = props.user_collected_properties();
         if let Some(pair) = read_stats_from_table_props(&user_props) {
-            if pair.applied_log_index() > max_log_index {
+            if pair.applied_log_index() > max_log_index
+                || (pair.applied_log_index() == max_log_index && pair.seqno() > max_seqno)
+            {
                 max_log_index = pair.applied_log_index();
                 max_seqno = pair.seqno();
             }
@@ -235,6 +240,26 @@ mod tests {
         assert_eq!(pair.seqno(), 5);
 
         assert!(read_stats_from_table_props(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_read_stats_rejects_malformed_values() {
+        let mut m = HashMap::new();
+        m.insert(PROPERTY_KEY.as_bytes().to_vec(), b"233333/5/extra".to_vec());
+        assert!(
+            read_stats_from_table_props(&m).is_none(),
+            "Should reject extra segments"
+        );
+
+        let mut m = HashMap::new();
+        m.insert(
+            PROPERTY_KEY.as_bytes().to_vec(),
+            b"233333/5/extra/segments".to_vec(),
+        );
+        assert!(
+            read_stats_from_table_props(&m).is_none(),
+            "Should reject multiple extra segments"
+        );
     }
 
     #[test]

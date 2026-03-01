@@ -61,6 +61,39 @@ pub const CF_NAMES: [&str; COLUMN_FAMILY_COUNT] = [
     "zset_score_cf", // ZsetsScoreCF = 5
 ];
 
+const _: () = assert!(
+    CF_NAMES.len() == storage::ColumnFamilyIndex::COUNT,
+    "CF_NAMES length must match storage::ColumnFamilyIndex::COUNT"
+);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cf_names_match_storage() {
+        use storage::ColumnFamilyIndex;
+        let variants: [ColumnFamilyIndex; ColumnFamilyIndex::COUNT] = [
+            ColumnFamilyIndex::MetaCF,
+            ColumnFamilyIndex::HashesDataCF,
+            ColumnFamilyIndex::SetsDataCF,
+            ColumnFamilyIndex::ListsDataCF,
+            ColumnFamilyIndex::ZsetsDataCF,
+            ColumnFamilyIndex::ZsetsScoreCF,
+        ];
+        for (i, cf_index) in variants.iter().enumerate() {
+            assert_eq!(
+                cf_index.name(),
+                CF_NAMES[i],
+                "CF_NAMES[{}] mismatch: expected '{}', got '{}'",
+                i,
+                cf_index.name(),
+                CF_NAMES[i]
+            );
+        }
+    }
+}
+
 /// Convert CF name to index
 pub fn cf_name_to_index(name: &[u8]) -> Option<usize> {
     CF_NAMES.iter().position(|n| n.as_bytes() == name)
