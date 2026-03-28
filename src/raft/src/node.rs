@@ -17,6 +17,7 @@
 
 use conf::raft_type::{Binlog, BinlogResponse, KiwiNode, KiwiTypeConfig};
 use openraft::{Config, Raft};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -64,6 +65,8 @@ pub struct RaftConfig {
     pub raft_addr: String,
     pub resp_addr: String,
     pub data_dir: PathBuf,
+    /// RocksDB data directory (`<db_path>/0`, …) — must match the opened `Storage` path.
+    pub db_path: PathBuf,
     pub heartbeat_interval: u64,
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
@@ -78,6 +81,7 @@ impl Default for RaftConfig {
             raft_addr: "127.0.0.1:8081".to_string(),
             resp_addr: "127.0.0.1:6379".to_string(),
             data_dir: PathBuf::from("/tmp/kiwi/raft"),
+            db_path: PathBuf::from("/tmp/kiwi/db"),
             heartbeat_interval: 200,
             election_timeout_min: 500,
             election_timeout_max: 1000,
@@ -104,7 +108,14 @@ pub async fn create_raft_node(
     storage: Arc<Storage>,
 ) -> Result<Arc<RaftApp>, anyhow::Error> {
     let raft_config = build_raft_config(&config)?;
-    let state_machine = KiwiStateMachine::new(config.node_id, storage.clone());
+    let snapshot_work_dir = config.data_dir.join("snapshots");
+    fs::create_dir_all(&snapshot_work_dir)?;
+    let state_machine = KiwiStateMachine::new(
+        config.node_id,
+        storage.clone(),
+        config.db_path.clone(),
+        snapshot_work_dir,
+    );
     let network = KiwiNetworkFactory::new();
 
     let raft = if config.use_memory_log_store {
