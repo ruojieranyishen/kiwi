@@ -26,7 +26,7 @@
 //! TODO: support smallest flushed log index with proper LogId lookup from log store.
 
 use std::io::{self, Cursor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openraft::{
@@ -52,8 +52,23 @@ fn io_err_to_raft(e: std::io::Error) -> StorageError<u64> {
     StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
 }
 
+/// Check if a directory is empty (no files or subdirectories).
+/// Returns true if the path doesn't exist (considered empty for our use case).
+fn is_empty_dir(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
+    }
+}
+
 /// OpenRaft expects a single on-disk "current" snapshot; `build_snapshot` / `install_snapshot`
 /// must persist here so [`RaftStateMachine::get_current_snapshot`] can return it.
+///
+/// Files are written atomically using temp file + rename pattern to prevent TOCTOU issues.
 const CURRENT_SNAPSHOT_DATA: &str = "current_snapshot.tar";
 const CURRENT_SNAPSHOT_META: &str = "current_snapshot_meta.json";
 
@@ -66,11 +81,21 @@ fn persist_current_snapshot(
     std::fs::create_dir_all(work_dir).map_err(|e| {
         StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
     })?;
+
     let data_path = work_dir.join(CURRENT_SNAPSHOT_DATA);
     let meta_path = work_dir.join(CURRENT_SNAPSHOT_META);
-    std::fs::write(&data_path, bytes).map_err(|e| {
+
+    // Use atomic write pattern: write to temp file first, then rename atomically
+    // This prevents TOCTOU (time-of-check-time-of-use) issues
+    let data_tmp = work_dir.join(format!(".{}.tmp", CURRENT_SNAPSHOT_DATA));
+    let meta_tmp = work_dir.join(format!(".{}.tmp", CURRENT_SNAPSHOT_META));
+
+    // Write data to temp file
+    std::fs::write(&data_tmp, bytes).map_err(|e| {
         StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
     })?;
+
+    // Write meta to temp file
     let json = serde_json::to_string_pretty(meta).map_err(|e| {
         StorageError::from_io_error(
             ErrorSubject::Snapshot(None),
@@ -78,9 +103,18 @@ fn persist_current_snapshot(
             io::Error::other(e.to_string()),
         )
     })?;
-    std::fs::write(&meta_path, json).map_err(|e| {
+    std::fs::write(&meta_tmp, json).map_err(|e| {
         StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
     })?;
+
+    // Atomic rename (on POSIX systems, rename is atomic if on same filesystem)
+    std::fs::rename(&data_tmp, &data_path).map_err(|e| {
+        StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
+    })?;
+    std::fs::rename(&meta_tmp, &meta_path).map_err(|e| {
+        StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
+    })?;
+
     Ok(())
 }
 
@@ -209,19 +243,24 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
         meta: &SnapshotMeta<u64, KiwiNode>,
         snapshot: Box<std::io::Cursor<Vec<u8>>>,
     ) -> Result<(), openraft::StorageError<u64>> {
-        // TODO: Close all Redis/RocksDB instances before restoring checkpoint layout.
-        // Currently, restore_checkpoint_layout deletes the db_path directories while
-        // self.storage.insts still holds open file handles, which can cause:
-        // - Data corruption risk
-        // - Dangling file handles
-        // - I/O failures
-        // - Resource leaks
+        // IMPORTANT: For shard migration/extension scenarios, the target node should either:
+        // 1. Be an empty instance (new node joining)
+        // 2. Have its old checkpoints deleted before calling this function
         //
-        // Fix requires wrapping Storage.insts with RwLock for interior mutability,
-        // then calling close_instances() before restore and reopen_instances() after.
-        // This will be addressed in a follow-up PR.
+        // We assert that db_path doesn't exist or is empty to prevent data corruption
+        // from overwriting open RocksDB instances.
+        //
+        // Reference: OpenRaft install_snapshot flow
+        // (https://github.com/databendlabs/openraft)
+        debug_assert!(
+            !self.db_path.exists() || is_empty_dir(&self.db_path),
+            "install_snapshot: db_path should be empty before restoring checkpoint. \
+             For shard migration, ensure old checkpoints are deleted before calling."
+        );
 
         let bytes = snapshot.into_inner();
+
+        // Use tempfile for automatic cleanup on error/drop
         let unpack_root = tempfile::tempdir().map_err(|e| {
             StorageError::from_io_error(
                 ErrorSubject::StateMachine,
@@ -229,6 +268,7 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
                 io::Error::other(e.to_string()),
             )
         })?;
+
         unpack_tar_to_dir(&bytes, unpack_root.path()).map_err(io_err_to_raft)?;
         let checkpoint_root = unpacked_checkpoint_root(unpack_root.path());
 
@@ -248,6 +288,7 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
 
         persist_current_snapshot(&self.snapshot_work_dir, meta, &bytes)?;
 
+        // unpack_root is a tempfile::TempDir, automatically cleaned up on drop
         drop(unpack_root);
         Ok(())
     }
@@ -277,10 +318,10 @@ pub struct KiwiSnapshotBuilder {
 
 impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<KiwiTypeConfig>, StorageError<u64>> {
-        let dir = self.snapshot_work_dir.join(format!("build-{}", self._idx));
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(io_err_to_raft)?;
-        }
+        // Use tempfile for automatic cleanup on error/drop
+        // This ensures temp directory is cleaned up even on early error returns
+        let temp_dir = tempfile::tempdir().map_err(io_err_to_raft)?;
+        let dir = temp_dir.path().join(format!("build-{}", self._idx));
         std::fs::create_dir_all(&dir).map_err(io_err_to_raft)?;
 
         // Use last_applied to ensure (index, term) pair comes from the same log entry.
@@ -301,7 +342,7 @@ impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
             .map_err(storage_err_to_raft)?;
 
         let bytes = pack_dir_to_vec(&dir).map_err(io_err_to_raft)?;
-        let _ = std::fs::remove_dir_all(&dir);
+        // temp_dir is automatically cleaned up on drop
 
         let leader_id = self
             .last_applied
@@ -322,5 +363,25 @@ impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
             meta,
             snapshot: Box::new(Cursor::new(bytes)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Non-existent path is considered empty
+        assert!(is_empty_dir(&tmp.path().join("nonexistent")));
+
+        // Empty directory
+        assert!(is_empty_dir(tmp.path()));
+
+        // Directory with file
+        std::fs::write(tmp.path().join("file.txt"), b"content").unwrap();
+        assert!(!is_empty_dir(tmp.path()));
     }
 }

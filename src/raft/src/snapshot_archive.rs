@@ -35,11 +35,49 @@ pub fn pack_dir_to_vec(src: &Path) -> io::Result<Vec<u8>> {
 }
 
 /// Unpack a tar archive (from `build_snapshot` / OpenRaft `SnapshotData`) into `dst`.
+///
+/// # Security
+///
+/// This function validates tar entries to prevent path traversal attacks.
+/// Any entry containing `..` components or escaping the destination directory
+/// will be rejected.
 pub fn unpack_tar_to_dir(bytes: &[u8], dst: &Path) -> io::Result<()> {
-    if dst.exists() {
-        std::fs::remove_dir_all(dst)?;
+    // 1. Validate dst is a directory if it exists
+    if dst.exists() && !dst.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination is not a directory: {}", dst.display()),
+        ));
     }
+
     std::fs::create_dir_all(dst)?;
+
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+
+    // 2. Validate all entries before unpacking to prevent path traversal attacks
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?.to_path_buf();
+
+        // Check for path traversal attempts
+        if path.components().any(|c| c.as_os_str() == "..") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("malicious path detected (contains '..'): {:?}", path),
+            ));
+        }
+
+        // Ensure the full path stays within dst
+        let full_path = dst.join(&path);
+        if !full_path.starts_with(dst) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("path escapes destination: {:?}", path),
+            ));
+        }
+    }
+
+    // 3. Safe to unpack - all entries validated
     let mut archive = tar::Archive::new(Cursor::new(bytes));
     archive.unpack(dst)?;
     Ok(())
@@ -78,5 +116,49 @@ mod tests {
         let m = RaftSnapshotMeta::read_from_dir(&root).unwrap();
         assert_eq!(m.last_included_index, 7);
         assert_eq!(m.last_included_term, 3);
+    }
+
+    #[test]
+    fn test_unpack_rejects_non_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("not_a_dir");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let result = unpack_tar_to_dir(&[0u8; 10], &file_path);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_unpack_rejects_path_traversal() {
+        // Create a malicious tar with path traversal
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("ck");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("normal_file"), b"normal content").unwrap();
+
+        // Create normal tar first
+        let bytes = pack_dir_to_vec(&src).unwrap();
+
+        // Manually craft a tar with malicious path
+        let mut malicious_tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut malicious_tar);
+            // Add a file with path traversal attempt
+            let mut header = tar::Header::new_gnu();
+            header.set_path("../../../etc/passwd").unwrap();
+            header.set_size(4);
+            header.set_cksum();
+            builder.append(&header, b"root").unwrap();
+            builder.finish().unwrap();
+        }
+
+        let dst = tempfile::tempdir().unwrap();
+        let unpack = dst.path().join("u");
+
+        let result = unpack_tar_to_dir(&malicious_tar, &unpack);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(".."));
     }
 }
