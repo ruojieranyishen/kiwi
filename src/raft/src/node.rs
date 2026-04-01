@@ -16,7 +16,7 @@
 // limitations under the License.
 
 use conf::raft_type::{Binlog, BinlogResponse, KiwiNode, KiwiTypeConfig};
-use openraft::{Config, Raft};
+use openraft::{Config, Raft, SnapshotPolicy};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -70,9 +70,28 @@ pub struct RaftConfig {
     pub heartbeat_interval: u64,
     pub election_timeout_min: u64,
     pub election_timeout_max: u64,
-    /// 是否使用内存日志存储，默认 false（使用 RocksDB 持久化存储）
+    /// Whether to use in-memory log store, default false (uses RocksDB for persistence)
     pub use_memory_log_store: bool,
+
+    // Snapshot configuration
+    /// Number of logs since last snapshot to trigger a new snapshot
+    pub snapshot_logs_threshold: u64,
+    /// Maximum chunk size for snapshot transfer (bytes)
+    pub snapshot_max_chunk_size: u64,
+    /// Timeout for installing a snapshot (milliseconds)
+    pub install_snapshot_timeout: u64,
+    /// Maximum number of logs to keep that are already in snapshot
+    pub max_in_snapshot_log_to_keep: u64,
+    /// Replication lag threshold to use snapshot for catch-up
+    pub replication_lag_threshold: u64,
 }
+
+// Snapshot configuration defaults
+const SNAPSHOT_LOGS_THRESHOLD: u64 = 5000;
+const SNAPSHOT_MAX_CHUNK_SIZE: u64 = 3 * 1024 * 1024; // 3MB
+const INSTALL_SNAPSHOT_TIMEOUT: u64 = 200; // milliseconds
+const MAX_IN_SNAPSHOT_LOG_TO_KEEP: u64 = 1000;
+const REPLICATION_LAG_THRESHOLD: u64 = 5000;
 
 impl Default for RaftConfig {
     fn default() -> Self {
@@ -86,16 +105,43 @@ impl Default for RaftConfig {
             election_timeout_min: 500,
             election_timeout_max: 1000,
             use_memory_log_store: false,
+            snapshot_logs_threshold: SNAPSHOT_LOGS_THRESHOLD,
+            snapshot_max_chunk_size: SNAPSHOT_MAX_CHUNK_SIZE,
+            install_snapshot_timeout: INSTALL_SNAPSHOT_TIMEOUT,
+            max_in_snapshot_log_to_keep: MAX_IN_SNAPSHOT_LOG_TO_KEEP,
+            replication_lag_threshold: REPLICATION_LAG_THRESHOLD,
         }
     }
 }
 
-/// 构建通用的 Raft 配置
+/// Build common Raft configuration with validation
 fn build_raft_config(config: &RaftConfig) -> Result<Arc<Config>, anyhow::Error> {
+    // Validate snapshot configuration parameters
+    if config.snapshot_logs_threshold == 0 {
+        return Err(anyhow::anyhow!("snapshot_logs_threshold must be > 0"));
+    }
+    if config.snapshot_max_chunk_size == 0 {
+        return Err(anyhow::anyhow!("snapshot_max_chunk_size must be > 0"));
+    }
+    if config.install_snapshot_timeout == 0 {
+        return Err(anyhow::anyhow!("install_snapshot_timeout must be > 0"));
+    }
+    if config.replication_lag_threshold == 0 {
+        return Err(anyhow::anyhow!("replication_lag_threshold must be > 0"));
+    }
+
     let raft_config = Config {
         heartbeat_interval: config.heartbeat_interval,
         election_timeout_min: config.election_timeout_min,
         election_timeout_max: config.election_timeout_max,
+
+        // Snapshot configuration
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(config.snapshot_logs_threshold),
+        replication_lag_threshold: config.replication_lag_threshold,
+        snapshot_max_chunk_size: config.snapshot_max_chunk_size,
+        install_snapshot_timeout: config.install_snapshot_timeout,
+        max_in_snapshot_log_to_keep: config.max_in_snapshot_log_to_keep,
+
         ..Default::default()
     };
     Ok(Arc::new(raft_config.validate()?))
