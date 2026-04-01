@@ -26,14 +26,30 @@ use serde::{Deserialize, Serialize};
 /// File name for JSON metadata at the checkpoint root (not OpenRaft's `SnapshotMeta`).
 pub const RAFT_SNAPSHOT_META_FILE: &str = "__raft_snapshot_meta";
 
+/// Current snapshot format version
+pub const CURRENT_SNAPSHOT_VERSION: u32 = 1;
+
 /// Metadata persisted next to per-instance checkpoint directories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RaftSnapshotMeta {
+    /// Snapshot format version
+    pub version: u32,
+    /// Last log index included in the snapshot
     pub last_included_index: u64,
+    /// Last log term included in the snapshot
     pub last_included_term: u64,
 }
 
 impl RaftSnapshotMeta {
+    /// Create a new snapshot meta with current version
+    pub fn new(last_included_index: u64, last_included_term: u64) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+        }
+    }
+
     pub fn write_to_dir(&self, dir: &Path) -> io::Result<()> {
         let path = dir.join(RAFT_SNAPSHOT_META_FILE);
         let json = serde_json::to_string_pretty(self)
@@ -61,7 +77,21 @@ impl RaftSnapshotMeta {
     pub fn read_from_dir(dir: &Path) -> io::Result<Self> {
         let path = dir.join(RAFT_SNAPSHOT_META_FILE);
         let bytes = fs::read(path)?;
-        serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let meta: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Validate version
+        if meta.version < CURRENT_SNAPSHOT_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported snapshot version: {}, expected >= {}",
+                    meta.version, CURRENT_SNAPSHOT_VERSION
+                ),
+            ));
+        }
+
+        Ok(meta)
     }
 }
 

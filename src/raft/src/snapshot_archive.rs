@@ -98,10 +98,7 @@ mod tests {
         let src = tmp.path().join("ck");
         std::fs::create_dir_all(src.join("0")).unwrap();
         std::fs::write(src.join("0").join("marker"), b"x").unwrap();
-        let meta = RaftSnapshotMeta {
-            last_included_index: 7,
-            last_included_term: 3,
-        };
+        let meta = RaftSnapshotMeta::new(7, 3);
         meta.write_to_dir(&src).unwrap();
 
         let bytes = pack_dir_to_vec(&src).unwrap();
@@ -113,6 +110,7 @@ mod tests {
         let root = unpacked_checkpoint_root(&unpack);
         assert!(root.join("0").join("marker").exists());
         let m = RaftSnapshotMeta::read_from_dir(&root).unwrap();
+        assert_eq!(m.version, 1);
         assert_eq!(m.last_included_index, 7);
         assert_eq!(m.last_included_term, 3);
     }

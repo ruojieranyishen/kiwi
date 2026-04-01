@@ -320,10 +320,7 @@ impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
             // No log applied yet, use initial state
             (0, 0)
         };
-        let raft_meta = RaftSnapshotMeta {
-            last_included_index: last_idx,
-            last_included_term: last_term,
-        };
+        let raft_meta = RaftSnapshotMeta::new(last_idx, last_term);
 
         self._storage
             .create_checkpoint(&dir, &raft_meta)
