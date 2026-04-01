@@ -229,20 +229,26 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
     ) -> Result<(), openraft::StorageError<u64>> {
         // Safety check: ensure db_path is empty before restoring checkpoint.
         // This prevents data corruption when installing snapshot on a node with existing data.
-        // In sharding migration scenarios, the target node should clean old checkpoints
-        // before calling install_snapshot.
+        // Snapshot installation is only allowed on nodes with an empty database directory.
         if self.db_path.exists() {
             let is_empty = std::fs::read_dir(&self.db_path)
                 .map(|mut e| e.next().is_none())
                 .unwrap_or(false);
-            debug_assert!(
-                is_empty,
-                "install_snapshot: db_path should be empty or cleaned before restoring checkpoint"
-            );
-            // If not empty, remove it to ensure clean restore
             if !is_empty {
-                std::fs::remove_dir_all(&self.db_path).map_err(io_err_to_raft)?;
+                return Err(StorageError::from_io_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "db_path ({}) is not empty; snapshot installation requires an empty database directory",
+                            self.db_path.display()
+                        ),
+                    ),
+                ));
             }
+            // If exists but empty, remove it to ensure clean restore
+            std::fs::remove_dir_all(&self.db_path).map_err(io_err_to_raft)?;
         }
 
         let bytes = snapshot.into_inner();
