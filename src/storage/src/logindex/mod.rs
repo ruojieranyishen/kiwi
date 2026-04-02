@@ -34,7 +34,7 @@ pub mod event_listener;
 pub use types::{LogIndex, SequenceNumber, LogIndexSeqnoPair, LogIndexAndSequencePair};
 pub use collector::LogIndexAndSequenceCollector;
 pub use db_access::DbCfAccess;
-pub use cf_tracker::{LogIndexOfColumnFamilies, SmallestIndexRes, COLUMN_FAMILY_COUNT};
+pub use cf_tracker::{LogIndexOfColumnFamilies, SmallestIndexRes};
 pub use table_properties::{
     LogIndexTablePropertiesCollectorFactory,
     PROPERTY_KEY,
@@ -47,3 +47,5 @@ pub use event_listener::{
     FlushTrigger,
     cf_name_to_index,
 };
+// Re-export cf_metadata for unified CF name access
+pub use types::cf_metadata;

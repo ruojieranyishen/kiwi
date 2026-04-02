@@ -23,9 +23,7 @@ use parking_lot::RwLock;
 
 use crate::logindex::db_access::{DbCfAccess, Result};
 use crate::logindex::types::{LogIndex, LogIndexSeqnoPair, SequenceNumber};
-
-/// Number of column families - defined here to avoid dependency on storage::ColumnFamilyIndex
-pub const COLUMN_FAMILY_COUNT: usize = 6;
+use crate::logindex::types::cf_metadata::COLUMN_FAMILY_COUNT;
 
 /// Each CF's applied (latest in memtable) and flushed (latest in SST)
 struct LogIndexPair {
@@ -219,15 +217,13 @@ impl LogIndexOfColumnFamilies {
             s.insert(state.cf[i].applied_index.log_index());
             s.insert(state.cf[i].flushed_index.log_index());
         }
-        if s.is_empty() {
-            return 0;
+
+        // Calculate gap between min and max values
+        let mut iter = s.iter();
+        match (iter.next(), iter.next_back()) {
+            (Some(first), Some(last)) => last.saturating_sub(*first) as u64,
+            _ => 0,
         }
-        if s.len() == 1 {
-            return 0;
-        }
-        let first = *s.first().expect("BTreeSet has at least 2 elements");
-        let last = *s.last().expect("BTreeSet has at least 2 elements");
-        last.saturating_sub(first) as u64
     }
 
     pub fn set_last_flush_index(&self, log_index: LogIndex, seqno: SequenceNumber) {
@@ -272,19 +268,13 @@ mod tests {
     use super::*;
     use crate::logindex::{LogIndexAndSequenceCollector, LogIndexTablePropertiesCollectorFactory};
     use crate::logindex::db_access::DbCfAccess;
+    use crate::logindex::types::LogIndexError;
     use rocksdb::{ColumnFamilyDescriptor, DB, Options};
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    // CF names for testing - should match storage::ColumnFamilyIndex
-    const CF_NAMES: [&str; COLUMN_FAMILY_COUNT] = [
-        "default",       // MetaCF = 0
-        "hash_data_cf",  // HashesDataCF = 1
-        "set_data_cf",   // SetsDataCF = 2
-        "list_data_cf",  // ListsDataCF = 3
-        "zset_data_cf",  // ZsetsDataCF = 4
-        "zset_score_cf", // ZsetsScoreCF = 5
-    ];
+    // Use centralized CF names from cf_metadata module
+    use crate::logindex::types::cf_metadata::CF_NAMES_STR;
 
     struct MultiCfDbAccess<'a> {
         db: &'a DB,
@@ -295,11 +285,11 @@ mod tests {
             &self,
             cf_id: usize,
         ) -> Result<rocksdb::table_properties::TablePropertiesCollection> {
-            if cf_id < CF_NAMES.len() {
-                let cf = self.db.cf_handle(CF_NAMES[cf_id]).expect("cf handle");
-                self.db.get_properties_of_all_tables_cf(&cf)
+            if cf_id < CF_NAMES_STR.len() {
+                let cf = self.db.cf_handle(CF_NAMES_STR[cf_id]).ok_or_else(|| LogIndexError::CfNotFound { cf_name: CF_NAMES_STR[cf_id].to_string() })?;
+                self.db.get_properties_of_all_tables_cf(&cf).map_err(|e| LogIndexError::RocksDb { source: e })
             } else {
-                self.db.get_properties_of_all_tables()
+                Err(LogIndexError::InvalidCfId { cf_id })
             }
         }
     }
@@ -319,7 +309,7 @@ mod tests {
         opts.create_missing_column_families(true);
         opts.set_table_properties_collector_factory(factory);
 
-        let cfs: Vec<ColumnFamilyDescriptor> = CF_NAMES
+        let cfs: Vec<ColumnFamilyDescriptor> = CF_NAMES_STR
             .iter()
             .map(|n| ColumnFamilyDescriptor::new(*n, opts.clone()))
             .collect();

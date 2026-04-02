@@ -17,8 +17,13 @@
 
 //! DbCfAccess trait: thin wrapper interface for getting TableProperties by CF
 
+use rocksdb::DB;
+
+use crate::logindex::types::cf_metadata::CF_NAMES_STR;
+use crate::logindex::types::LogIndexError;
+
 /// Result type for DbCfAccess operations
-pub type Result<T> = std::result::Result<T, rocksdb::Error>;
+pub type Result<T> = std::result::Result<T, LogIndexError>;
 
 /// Thin wrapper interface: provides ability to get TableProperties by CF
 ///
@@ -32,4 +37,26 @@ pub trait DbCfAccess {
         &self,
         cf_id: usize,
     ) -> Result<rocksdb::table_properties::TablePropertiesCollection>;
+}
+
+/// Concrete implementation of DbCfAccess for rocksdb::DB
+pub struct DbAccess<'a> {
+    db: &'a DB,
+}
+
+impl<'a> DbAccess<'a> {
+    pub fn new(db: &'a DB) -> Self {
+        Self { db }
+    }
+}
+
+impl DbCfAccess for DbAccess<'_> {
+    fn get_properties_of_all_tables_cf(
+        &self,
+        cf_id: usize,
+    ) -> Result<rocksdb::table_properties::TablePropertiesCollection> {
+        let cf_name = CF_NAMES_STR.get(cf_id).ok_or_else(|| LogIndexError::InvalidCfId { cf_id })?;
+        let cf = self.db.cf_handle(cf_name).ok_or_else(|| LogIndexError::CfNotFound { cf_name: cf_name.to_string() })?;
+        self.db.get_properties_of_all_tables_cf(&cf).map_err(|e| LogIndexError::RocksDb { source: e })
+    }
 }

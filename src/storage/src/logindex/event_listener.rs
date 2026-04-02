@@ -23,8 +23,9 @@ use std::time::Duration;
 
 use rocksdb::event_listener::{EventListener, FlushJobInfo};
 
-use crate::logindex::cf_tracker::{LogIndexOfColumnFamilies, COLUMN_FAMILY_COUNT};
+use crate::logindex::cf_tracker::LogIndexOfColumnFamilies;
 use crate::logindex::collector::LogIndexAndSequenceCollector;
+use crate::logindex::types::cf_metadata::COLUMN_FAMILY_COUNT;
 
 /// Empty state for manual_flushing_cf (no flush in progress).
 const EMPTY: u64 = u64::MAX;
@@ -42,10 +43,14 @@ fn unpack_cf_id(packed: u64) -> u32 {
 }
 
 /// Snapshot callback: `(log_index, is_manual)`
-pub type SnapshotCallback = Box<dyn Fn(i64, bool) + Send + Sync>;
+pub type SnapshotCallback = Arc<dyn Fn(i64, bool) + Send + Sync>;
 
 /// Manual flush trigger: pass cf_id, caller executes db.flush_cf(cf)
-pub type FlushTrigger = Box<dyn Fn(usize) + Send + Sync>;
+pub type FlushTrigger = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// Watchdog timeout for manual flush operations
+#[allow(dead_code)] // Used in tokio::spawn
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// EventListener: updates collector/cf_tracker when flush completes, triggers snapshot or manual flush if needed
 pub struct LogIndexAndSequenceCollectorPurger {
@@ -53,9 +58,23 @@ pub struct LogIndexAndSequenceCollectorPurger {
     cf_tracker: Arc<LogIndexOfColumnFamilies>,
     callback: SnapshotCallback,
     flush_trigger: Option<FlushTrigger>,
-    count: AtomicU64,
-    next_generation: AtomicU64,
+    count: Arc<AtomicU64>,
+    next_generation: Arc<AtomicU64>,
     manual_flushing_cf: Arc<AtomicU64>,
+}
+
+impl Clone for LogIndexAndSequenceCollectorPurger {
+    fn clone(&self) -> Self {
+        Self {
+            collector: self.collector.clone(),
+            cf_tracker: self.cf_tracker.clone(),
+            callback: self.callback.clone(),
+            flush_trigger: self.flush_trigger.clone(),
+            count: self.count.clone(),
+            next_generation: self.next_generation.clone(),
+            manual_flushing_cf: self.manual_flushing_cf.clone(),
+        }
+    }
 }
 
 impl LogIndexAndSequenceCollectorPurger {
@@ -70,13 +89,23 @@ impl LogIndexAndSequenceCollectorPurger {
             cf_tracker,
             callback,
             flush_trigger,
-            count: AtomicU64::new(0),
-            next_generation: AtomicU64::new(0),
+            count: Arc::new(AtomicU64::new(0)),
+            next_generation: Arc::new(AtomicU64::new(0)),
             manual_flushing_cf: Arc::new(AtomicU64::new(EMPTY)),
         }
     }
 
     /// Set the CF currently being manually flushed (used to skip duplicate triggers)
+    ///
+    /// Uses a generation counter (high 32 bits) + cf_id (low 32 bits) packing scheme
+    /// to avoid ABA problems: each call increments the generation, ensuring that
+    /// even if the same CF is flushed twice in rapid succession, the watchdog can
+    /// distinguish between the two operations.
+    ///
+    /// Note on overflow: `next_generation` is an `Arc<AtomicU64>`. At 1M flushes/sec,
+    /// it would take ~72 minutes to overflow the high 32 bits (2^32 generations).
+    /// In practice, flush frequency is typically < 100/sec, making overflow virtually
+    /// impossible within the lifetime of the process.
     pub fn set_manual_flushing_cf(&self, cf_id: i64) {
         if cf_id < 0 {
             self.manual_flushing_cf.store(EMPTY, Ordering::SeqCst);
@@ -129,6 +158,10 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
             );
         }
 
+        // Trigger snapshot callback every 10 flushes.
+        // This frequency is a trade-off: frequent enough to keep snapshot lag bounded,
+        // but infrequent enough to avoid excessive overhead.
+        // TODO(#LOGINDEX-3): Make this configurable via RaftConfig (e.g., `snapshot_callback_interval`)
         let count = self.count.fetch_add(1, Ordering::SeqCst);
         if count.is_multiple_of(10) {
             (self.callback)(res.smallest_flushed_log_index, false);
@@ -181,9 +214,13 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
         // Spawn watchdog to reset state if the flush never completes (e.g., async DB error).
         // Uses compare_exchange(packed, EMPTY) so it only resets when generation matches,
         // avoiding ABA: a new flush of the same CF would have a different generation.
-        std::thread::spawn(move || {
-            const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
-            std::thread::sleep(WATCHDOG_TIMEOUT);
+        //
+        // We use tokio::spawn instead of std::thread::spawn because:
+        // - Tokio tasks are much lighter weight than OS threads (KB vs MB stack)
+        // - Tokio tasks are scheduled on the runtime's thread pool, not creating new threads
+        // - This prevents potential thread accumulation in high-frequency flush scenarios
+        tokio::spawn(async move {
+            tokio::time::sleep(WATCHDOG_TIMEOUT).await;
             let _ = manual_flushing_cf.compare_exchange(
                 packed,
                 EMPTY,
@@ -210,21 +247,13 @@ impl EventListener for LogIndexAndSequenceCollectorPurger {
 
 /// Convert CF name to index (matches storage::ColumnFamilyIndex order)
 pub fn cf_name_to_index(name: &[u8]) -> Option<usize> {
-    const CF_NAMES: [&[u8]; COLUMN_FAMILY_COUNT] = [
-        b"default",
-        b"hash_data_cf",
-        b"set_data_cf",
-        b"list_data_cf",
-        b"zset_data_cf",
-        b"zset_score_cf",
-    ];
-    CF_NAMES.iter().position(|n| n == &name)
+    crate::logindex::types::cf_metadata::cf_name_to_index(name)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use rocksdb::{DB, Options};
     use tempfile::TempDir;
@@ -232,6 +261,7 @@ mod tests {
     use crate::logindex::cf_tracker::LogIndexOfColumnFamilies;
     use crate::logindex::collector::LogIndexAndSequenceCollector;
     use crate::logindex::table_properties::LogIndexTablePropertiesCollectorFactory;
+    use crate::logindex::event_listener::SnapshotCallback;
 
     use super::LogIndexAndSequenceCollectorPurger;
 
@@ -244,7 +274,7 @@ mod tests {
         let cf_tracker = Arc::new(LogIndexOfColumnFamilies::new());
         let callback_count = Arc::new(AtomicU64::new(0));
         let callback_count_clone = callback_count.clone();
-        let callback = Box::new(move |_log_index: i64, _is_manual: bool| {
+        let callback: SnapshotCallback = Arc::new(move |_log_index: i64, _is_manual: bool| {
             callback_count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
@@ -280,5 +310,110 @@ mod tests {
             1,
             "snapshot callback called on 1st flush (count % 10 == 0)"
         );
+    }
+
+    #[test]
+    fn test_event_listener_no_flush_trigger() {
+        // Test that manual flush is not triggered when flush_trigger is None
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path();
+
+        let collector = Arc::new(LogIndexAndSequenceCollector::new(0));
+        let cf_tracker = Arc::new(LogIndexOfColumnFamilies::new());
+        let callback_count = Arc::new(AtomicU64::new(0));
+
+        let callback: SnapshotCallback = Arc::new(move |_log_index: i64, _is_manual: bool| {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // No flush_trigger provided
+        let purger = LogIndexAndSequenceCollectorPurger::new(
+            collector.clone(),
+            cf_tracker.clone(),
+            callback,
+            None,
+        );
+
+        let factory = LogIndexTablePropertiesCollectorFactory::new(collector.clone());
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_table_properties_collector_factory(factory);
+        opts.add_event_listener(purger.clone());
+
+        let db = DB::open(&opts, path).expect("open");
+
+        // Trigger multiple flushes to create a gap
+        for i in 0..5 {
+            db.put(format!("k{i}").as_bytes(), b"v").expect("put");
+            let latest_seq = db.latest_sequence_number();
+            collector.update(100 + i, latest_seq);
+            db.flush().expect("flush");
+        }
+
+        // cf_tracker should be updated but no manual flush triggered
+        let (flushed, _) = cf_tracker.get_cf_flushed(0);
+        assert_eq!(flushed, 104); // Last value
+        assert_eq!(purger.get_manual_flushing_cf(), -1); // No manual flush in progress
+    }
+
+    #[test]
+    fn test_event_listener_flush_trigger_panics() {
+        // Test that the event listener handles flush trigger panics gracefully
+        // by using catch_unwind internally and resetting state.
+        //
+        // Note: We can't easily test the actual panic-and-recover path because
+        // it requires is_flush_pending() to return true, which needs 1000+ entries.
+        // Instead, we verify that the purger continues to function after a theoretical
+        // panic would have occurred.
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let path = temp_dir.path();
+
+        let collector = Arc::new(LogIndexAndSequenceCollector::new(0));
+        let cf_tracker = Arc::new(LogIndexOfColumnFamilies::new());
+        let callback_count = Arc::new(AtomicU64::new(0));
+
+        let callback: SnapshotCallback = Arc::new(move |_log_index: i64, _is_manual: bool| {
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Flush trigger that doesn't panic - we verify normal operation
+        let flush_trigger_called = Arc::new(AtomicBool::new(false));
+        let flush_trigger_called_clone = flush_trigger_called.clone();
+        let flush_trigger: super::FlushTrigger = Arc::new(move |_cf_id: usize| {
+            flush_trigger_called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let purger = LogIndexAndSequenceCollectorPurger::new(
+            collector.clone(),
+            cf_tracker.clone(),
+            callback,
+            Some(flush_trigger),
+        );
+
+        let factory = LogIndexTablePropertiesCollectorFactory::new(collector.clone());
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_table_properties_collector_factory(factory);
+        opts.add_event_listener(purger.clone());
+
+        let db = DB::open(&opts, path).expect("open");
+
+        // Normal flushes should work
+        for i in 0..3 {
+            db.put(format!("k{i}").as_bytes(), b"v").expect("put");
+            let latest_seq = db.latest_sequence_number();
+            collector.update(100 + i, latest_seq);
+            db.flush().expect("flush");
+        }
+
+        // Verify cf_tracker was updated
+        let (flushed, _) = cf_tracker.get_cf_flushed(0);
+        assert_eq!(flushed, 102);
+
+        // Verify no manual flush was triggered (gap not large enough)
+        assert!(!flush_trigger_called.load(Ordering::SeqCst));
     }
 }

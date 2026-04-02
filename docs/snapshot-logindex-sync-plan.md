@@ -565,18 +565,18 @@ cargo test --workspace
 
 ### 6.1 功能验收
 
-- [ ] collector 正确记录 `(log_index, seqno)` 映射
-- [ ] flush 完成时 cf_tracker 正确更新
-- [ ] snapshot 创建时包含正确的 logindex 状态
-- [ ] follower 安装 snapshot 后 cf_tracker 正确初始化
-- [ ] log purge 正确删除已包含在 snapshot 中的 log
+- [x] collector 正确记录 `(log_index, seqno)` 映射
+- [x] flush 完成时 cf_tracker 正确更新
+- [x] snapshot 创建时包含正确的 logindex 状态
+- [x] follower 安装 snapshot 后 cf_tracker 正确初始化
+- [x] log purge 正确删除已包含在 snapshot 中的 log
 
 ### 6.2 测试验收
 
-- [ ] `cargo test --package raft --test logindex_integration` 通过
-- [ ] `cargo test --package raft --test snapshot_roundtrip_test` 通过
-- [ ] `cargo test --package raft --test snapshot_logindex_test` 通过
-- [ ] `cargo test --workspace` 所有测试通过
+- [x] `cargo test --package raft --test logindex_integration` 通过
+- [x] `cargo test --package raft --test snapshot_roundtrip_test` 通过
+- [x] `cargo test --package raft --test snapshot_logindex_test` 通过
+- [x] `cargo test --workspace` 所有测试通过
 
 ### 6.3 性能验收
 
@@ -597,10 +597,174 @@ cargo test --workspace
 
 ---
 
-## 8. 参考资料
+## 8. 实现总结
 
-- `src/raft/src/collector.rs` - LogIndexAndSequenceCollector 实现
-- `src/raft/src/cf_tracker.rs` - LogIndexOfColumnFamilies 实现
-- `src/raft/src/event_listener.rs` - LogIndexAndSequenceCollectorPurger 实现
+### 8.1 已完成的修改
+
+#### 8.1.1 `src/storage/src/storage.rs` - on_binlog_write 集成 collector
+
+```rust
+pub fn on_binlog_write(&self, binlog: &Binlog, raft_log_index: u64) -> Result<()> {
+    // ... existing batch write logic ...
+    Box::new(batch).commit()?;
+
+    // Update collector with (log_index, seqno) mapping after successful commit
+    if let Some(ref db) = instance.db {
+        let seqno = db.latest_sequence_number();
+        if let Some(ref collector) = instance.logindex_collector {
+            collector.update(raft_log_index as i64, seqno);
+        }
+    }
+
+    Ok(())
+}
+```
+
+**关键点**：在 binlog commit 后，获取最新的 sequence number 并更新 collector，建立 `(log_index, seqno)` 映射。
+
+#### 8.1.2 `src/storage/src/logindex/collector.rs` - 添加状态导出
+
+```rust
+pub fn export_state(&self) -> Vec<String> {
+    let list = self.list.read();
+    list.iter()
+        .map(|pair| format!("{}:{}", pair.applied_log_index(), pair.seqno()))
+        .collect()
+}
+```
+
+**关键点**：导出 collector 状态为 `Vec<String>`，格式为 `"log_index:seqno"`，用于 snapshot 序列化。
+
+#### 8.1.3 `src/storage/src/checkpoint.rs` - RaftSnapshotMeta 扩展
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftSnapshotMeta {
+    pub version: u32,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    #[serde(default)]
+    pub logindex_collector_state: Vec<String>,  // 新增字段
+}
+
+impl RaftSnapshotMeta {
+    pub fn with_collector_state(
+        last_included_index: u64,
+        last_included_term: u64,
+        collector: &Arc<LogIndexAndSequenceCollector>,
+    ) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+            logindex_collector_state: collector.export_state(),
+        }
+    }
+
+    pub fn restore_collector_state(&self, collector: &Arc<LogIndexAndSequenceCollector>) {
+        for entry in &self.logindex_collector_state {
+            if let Some((log_index_str, seqno_str)) = entry.split_once(':') {
+                if let (Ok(log_index), Ok(seqno)) = (log_index_str.parse::<i64>(), seqno_str.parse::<u64>()) {
+                    collector.update(log_index, seqno);
+                }
+            }
+        }
+    }
+}
+```
+
+**关键点**：
+- `with_collector_state`：创建 snapshot 时保存 collector 状态
+- `restore_collector_state`：安装 snapshot 时恢复 collector 状态
+
+#### 8.1.4 `src/raft/src/state_machine.rs` - build_snapshot 集成
+
+```rust
+async fn build_snapshot(&mut self) -> Result<Snapshot<KiwiTypeConfig>, StorageError<u64>> {
+    // ... existing logic ...
+
+    // Create snapshot meta with collector state for logindex tracking
+    let raft_meta = RaftSnapshotMeta::with_collector_state(
+        last_idx,
+        last_term,
+        &self.collector,
+    );
+
+    // ... rest of snapshot creation ...
+}
+```
+
+#### 8.1.5 `src/raft/src/state_machine.rs` - install_snapshot 集成
+
+```rust
+async fn install_snapshot(
+    &mut self,
+    meta: &SnapshotMeta<u64, KiwiNode>,
+    snapshot: Box<std::io::Cursor<Vec<u8>>>,
+) -> Result<(), openraft::StorageError<u64>> {
+    // ... existing snapshot restore logic ...
+
+    // Read snapshot meta to get collector state
+    let file_meta = RaftSnapshotMeta::read_from_dir(&checkpoint_root).map_err(|e| {
+        StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, e)
+    })?;
+
+    // Initialize cf_tracker from restored SST properties first
+    self.init_cf_tracker().map_err(|e| {
+        StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Write, e)
+    })?;
+
+    // Restore collector state from snapshot metadata
+    file_meta.restore_collector_state(&self.collector);
+
+    // ... rest of snapshot install ...
+}
+```
+
+**关键点**：
+1. 先从 SST 恢复 cf_tracker（持久化的状态）
+2. 再从 snapshot meta 恢复 collector（内存中的映射队列）
+
+### 8.2 数据流
+
+```
+Write Request → Raft Log → State Machine.apply() → Storage.on_binlog_write()
+                                                        ↓
+                                          (log_index, seqno) → Collector
+                                                        ↓
+                                                   RocksDB Write
+                                                        ↓
+                                                  Flush Completed
+                                                        ↓
+                                    EventListener.on_flush_completed()
+                                    ↓                               ↓
+                            cf_tracker.update()              Collector.purge()
+                                    ↓                               ↓
+                            get_smallest_log_index() → Snapshot Check
+                                    ↓
+                            Purge Raft Logs (up to smallest_applied_log_index)
+
+Snapshot Creation:
+    Leader: build_snapshot()
+        → RaftSnapshotMeta.with_collector_state()
+        → collector.export_state() → logindex_collector_state
+        → persist to __raft_snapshot_meta
+
+Snapshot Restore:
+    Follower: install_snapshot()
+        → RaftSnapshotMeta.read_from_dir()
+        → restore_collector_state()
+        → replay (log_index, seqno) mappings to collector
+```
+
+---
+
+## 9. 参考资料
+
+- `src/storage/src/logindex/collector.rs` - LogIndexAndSequenceCollector 实现
+- `src/storage/src/logindex/cf_tracker.rs` - LogIndexOfColumnFamilies 实现
+- `src/storage/src/logindex/event_listener.rs` - LogIndexAndSequenceCollectorPurger 实现
+- `src/storage/src/logindex/table_properties.rs` - SST 属性写入
 - `src/raft/tests/logindex_integration.rs` - 现有集成测试
 - `src/raft/tests/snapshot_roundtrip_test.rs` - Snapshot roundtrip 测试
+- `src/raft/tests/snapshot_logindex_test.rs` - 新增完整流程集成测试

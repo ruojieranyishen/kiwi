@@ -156,11 +156,31 @@ pub async fn create_raft_node(
     let raft_config = build_raft_config(&config)?;
     let snapshot_work_dir = config.data_dir.join("snapshots");
     fs::create_dir_all(&snapshot_work_dir)?;
+
+    // Initialize logindex collector and cf_tracker from storage
+    // Use the first instance's collector and tracker (they are shared across instances)
+    // Both must come from the same source to maintain consistency.
+    // Storage must have initialized them during open - we require them to exist.
+    let (collector, cf_tracker) = match (
+        storage.get_logindex_collector(0),
+        storage.get_logindex_cf_tracker(0),
+    ) {
+        (Some(collector), Some(cf_tracker)) => (collector, cf_tracker),
+        _ => {
+            log::error!("Storage must have initialized logindex collector and cf_tracker before creating Raft node");
+            return Err(anyhow::anyhow!(
+                "Storage logindex not initialized: collector and cf_tracker must exist"
+            ));
+        }
+    };
+
     let state_machine = KiwiStateMachine::new(
         config.node_id,
         storage.clone(),
         config.db_path.clone(),
         snapshot_work_dir,
+        collector,
+        cf_tracker,
     );
     let network = KiwiNetworkFactory::new();
 

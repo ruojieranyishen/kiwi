@@ -159,6 +159,7 @@ fn test_snapshot_meta_max_version() {
         version: u32::MAX,
         last_included_index: 42,
         last_included_term: 7,
+        logindex_collector_state: Vec::new(),
     };
 
     let json = serde_json::to_string(&meta).unwrap();

@@ -17,11 +17,73 @@
 
 //! LogIndex type definitions
 
+use snafu::Snafu;
+
 /// LogIndex type alias (i64 to match RocksDB conventions)
 pub type LogIndex = i64;
 
 /// Sequence number type alias
 pub type SequenceNumber = u64;
+
+/// Error type for LogIndex operations
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum LogIndexError {
+    #[snafu(display("ColumnFamily {} not found in database", cf_name))]
+    CfNotFound { cf_name: String },
+
+    #[snafu(display("Invalid ColumnFamily index: {}", cf_id))]
+    InvalidCfId { cf_id: usize },
+
+    #[snafu(display("RocksDB error: {}", source))]
+    RocksDb { source: rocksdb::Error },
+
+    #[snafu(display("Unknown CF name: {:?}", name))]
+    UnknownCfName { name: Option<Vec<u8>> },
+}
+
+/// Result type for LogIndex operations
+pub type Result<T, E = LogIndexError> = std::result::Result<T, E>;
+
+/// Column Family metadata - single source of truth for CF names
+///
+/// This module provides centralized CF name definitions to avoid
+/// inconsistencies across db_access.rs, event_listener.rs, and cf_tracker.rs.
+pub mod cf_metadata {
+    /// Number of column families
+    pub const COLUMN_FAMILY_COUNT: usize = 6;
+
+    /// CF names as byte slices (for comparison with rocksdb CF handles)
+    /// Note: Using &[u8] instead of &[u8; N] to allow variable-length names
+    pub const CF_NAMES: &[&[u8]] = &[
+        b"default",       // 7 bytes, MetaCF = 0
+        b"hash_data_cf",  // 12 bytes, HashesDataCF = 1
+        b"set_data_cf",   // 11 bytes, SetsDataCF = 2
+        b"list_data_cf",  // 12 bytes, ListsDataCF = 3
+        b"zset_data_cf",  // 12 bytes, ZsetsDataCF = 4
+        b"zset_score_cf", // 13 bytes, ZsetsScoreCF = 5
+    ];
+
+    /// CF names as &str (for convenience in some contexts)
+    pub const CF_NAMES_STR: &[&str] = &[
+        "default",
+        "hash_data_cf",
+        "set_data_cf",
+        "list_data_cf",
+        "zset_data_cf",
+        "zset_score_cf",
+    ];
+
+    /// Convert CF name (bytes) to index
+    pub fn cf_name_to_index(name: &[u8]) -> Option<usize> {
+        CF_NAMES.iter().position(|n| n == &name)
+    }
+
+    /// Convert CF name (&str) to index
+    pub fn cf_name_str_to_index(name: &str) -> Option<usize> {
+        CF_NAMES_STR.iter().position(|n| n == &name)
+    }
+}
 
 /// Pair of (log_index, seqno) for tracking applied log state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

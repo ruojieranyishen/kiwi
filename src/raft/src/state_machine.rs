@@ -141,6 +141,10 @@ pub struct KiwiStateMachine {
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, KiwiNode>,
     snapshot_idx: u64,
+    /// LogIndex collector for Raft snapshot integration
+    collector: Arc<LogIndexAndSequenceCollector>,
+    /// LogIndex CF tracker for Raft snapshot integration
+    cf_tracker: Arc<LogIndexOfColumnFamilies>,
 }
 
 impl KiwiStateMachine {
@@ -149,6 +153,8 @@ impl KiwiStateMachine {
         storage: Arc<Storage>,
         db_path: PathBuf,
         snapshot_work_dir: PathBuf,
+        collector: Arc<LogIndexAndSequenceCollector>,
+        cf_tracker: Arc<LogIndexOfColumnFamilies>,
     ) -> Self {
         Self {
             _node_id: node_id,
@@ -158,7 +164,18 @@ impl KiwiStateMachine {
             last_applied: None,
             last_membership: StoredMembership::default(),
             snapshot_idx: 0,
+            collector,
+            cf_tracker,
         }
+    }
+
+    /// Initialize cf_tracker from storage SST properties (called after storage open or snapshot restore)
+    pub fn init_cf_tracker(&self) -> Result<(), io::Error> {
+        // Initialize cf_tracker from restored SST properties after snapshot install
+        // or from existing DB on startup
+        self.storage
+            .init_cf_trackers()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 }
 
@@ -214,6 +231,8 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
             _node_id: self._node_id,
+            collector: self.collector.clone(),
+            cf_tracker: self.cf_tracker.clone(),
         }
     }
 
@@ -263,7 +282,8 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
         unpack_tar_to_dir(&bytes, unpack_root.path()).map_err(io_err_to_raft)?;
         let checkpoint_root = unpacked_checkpoint_root(unpack_root.path());
 
-        let _file_meta = RaftSnapshotMeta::read_from_dir(&checkpoint_root).map_err(|e| {
+        // Read snapshot meta to get collector state
+        let file_meta = RaftSnapshotMeta::read_from_dir(&checkpoint_root).map_err(|e| {
             StorageError::from_io_error(ErrorSubject::Snapshot(None), ErrorVerb::Read, e)
         })?;
 
@@ -273,6 +293,20 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
             self.storage.db_instance_num,
         )
         .map_err(io_err_to_raft)?;
+
+        // Initialize cf_tracker from restored SST properties first
+        self.init_cf_tracker().map_err(|e| {
+            StorageError::from_io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                io::Error::other(e.to_string()),
+            )
+        })?;
+
+        // Restore collector state from snapshot metadata
+        // This is critical for logindex tracking: replays the (log_index, seqno) mappings
+        // that were captured when the snapshot was created
+        file_meta.restore_collector_state(&self.collector);
 
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
@@ -304,6 +338,11 @@ pub struct KiwiSnapshotBuilder {
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, KiwiNode>,
     _node_id: u64,
+    // Reserved for future LogIndex synchronization during snapshot creation
+    #[allow(dead_code)]
+    collector: Arc<LogIndexAndSequenceCollector>,
+    #[allow(dead_code)]
+    cf_tracker: Arc<LogIndexOfColumnFamilies>,
 }
 
 impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
@@ -321,7 +360,13 @@ impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
             // No log applied yet, use initial state
             (0, 0)
         };
-        let raft_meta = RaftSnapshotMeta::new(last_idx, last_term);
+
+        // Create snapshot meta with collector state for logindex tracking
+        let raft_meta = RaftSnapshotMeta::with_collector_state(
+            last_idx,
+            last_term,
+            &self.collector,
+        );
 
         self._storage
             .create_checkpoint(&dir, &raft_meta)

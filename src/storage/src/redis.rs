@@ -41,7 +41,10 @@ use crate::data_compaction_filter::DataCompactionFilterFactory;
 use crate::error::Error::RedisErr;
 use crate::error::InvalidFormatSnafu;
 use crate::error::{OptionNoneSnafu, Result, RocksSnafu};
-use crate::logindex::{LogIndexAndSequenceCollector, LogIndexOfColumnFamilies, LogIndexTablePropertiesCollectorFactory};
+use crate::logindex::{
+    LogIndexAndSequenceCollector, LogIndexOfColumnFamilies, LogIndexTablePropertiesCollectorFactory,
+    LogIndexAndSequenceCollectorPurger, SnapshotCallback, FlushTrigger,
+};
 use crate::meta_compaction_filter::MetaCompactionFilterFactory;
 use crate::options::{OptionType, StorageOptions};
 use crate::statistics::KeyStatistics;
@@ -175,6 +178,26 @@ impl Redis {
         let collector = Arc::new(LogIndexAndSequenceCollector::new(0));
         let cf_tracker = Arc::new(LogIndexOfColumnFamilies::new());
 
+        // Create snapshot callback - will be connected to Raft's snapshot trigger mechanism
+        let snapshot_callback: SnapshotCallback = Arc::new(move |log_index: i64, _is_manual: bool| {
+            log::info!("LogIndex snapshot callback triggered: log_index={}", log_index);
+            // TODO(#LOGINDEX-1): Connect to Raft's snapshot trigger mechanism
+        });
+
+        // Create flush trigger callback for manual flush
+        let flush_trigger: FlushTrigger = Arc::new(move |cf_id: usize| {
+            log::info!("LogIndex flush trigger for CF {}", cf_id);
+            // TODO(#LOGINDEX-2): Trigger manual flush for the specified CF
+        });
+
+        // Create event listener purger
+        let purger = LogIndexAndSequenceCollectorPurger::new(
+            collector.clone(),
+            cf_tracker.clone(),
+            snapshot_callback,
+            Some(flush_trigger),
+        );
+
         const CF_CONFIGS: &[(&str, bool, Option<usize>)] = &[
             ("default", true, None),                   // meta & string: bloom filter
             ("hash_data_cf", true, None),              // hash: bloom filter
@@ -194,6 +217,7 @@ impl Redis {
                     *block_size,
                     Some(&db_once_cell),
                     &collector,
+                    purger.clone(),
                 )
             })
             .collect();
@@ -212,6 +236,13 @@ impl Redis {
         self.db = Some(Box::new(engine));
         self.is_starting.store(false, Ordering::SeqCst);
 
+        // Initialize cf_tracker from SST properties
+        let rocksdb = db_arc.as_ref();
+        let access = crate::logindex::db_access::DbAccess::new(rocksdb);
+        if let Err(e) = cf_tracker.init(&access) {
+            log::warn!("Failed to initialize cf_tracker from SST properties: {}", e);
+        }
+
         // Store collector and tracker
         self.logindex_collector = Some(collector);
         self.logindex_cf_tracker = Some(cf_tracker);
@@ -227,6 +258,7 @@ impl Redis {
         block_size: Option<usize>,
         db_once_cell: Option<&Arc<OnceCell<Arc<DB>>>>,
         collector: &Arc<LogIndexAndSequenceCollector>,
+        purger: LogIndexAndSequenceCollectorPurger,
     ) -> ColumnFamilyDescriptor {
         let mut cf_opts = storage_options.options.clone();
         let mut table_opts = BlockBasedOptions::default();
@@ -263,6 +295,9 @@ impl Redis {
         // Set table properties collector factory for LogIndex tracking
         let factory = LogIndexTablePropertiesCollectorFactory::new(collector.clone());
         cf_opts.set_table_properties_collector_factory(factory);
+
+        // Add event listener for flush completion handling
+        cf_opts.add_event_listener(purger);
 
         // Set table factory
         cf_opts.set_block_based_table_factory(&table_opts);

@@ -60,19 +60,23 @@ impl LogIndexAndSequenceCollector {
             return 0;
         }
         let list = self.list.read();
-        if list.is_empty()
-            || seqno
-                < list
-                    .front()
-                    .expect("non-empty after is_empty check")
-                    .seqno()
-        {
+
+        // Check if list is empty or seqno is before the first element
+        let Some(front) = list.front() else {
+            return 0;
+        };
+        if seqno < front.seqno() {
             return 0;
         }
-        let back = list.back().expect("non-empty after is_empty check");
+
+        // Check if seqno is at or after the last element
+        let Some(back) = list.back() else {
+            return 0;
+        };
         if seqno >= back.seqno() {
             return back.applied_log_index();
         }
+
         // partition_point: the first position where predicate is false
         // i.e., the index of the first element where seqno() > seqno
         let idx = list.partition_point(|p| p.seqno() <= seqno);
@@ -132,6 +136,15 @@ impl LogIndexAndSequenceCollector {
     #[allow(dead_code)]
     pub fn set_max_gap(&mut self, gap: u64) {
         self.max_gap = gap;
+    }
+
+    /// Export state for snapshot serialization
+    /// Returns list of "log_index:seqno" strings
+    pub fn export_state(&self) -> Vec<String> {
+        let list = self.list.read();
+        list.iter()
+            .map(|pair| format!("{}:{}", pair.applied_log_index(), pair.seqno()))
+            .collect()
     }
 }
 

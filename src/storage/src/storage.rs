@@ -422,7 +422,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn on_binlog_write(&self, binlog: &Binlog, _raft_log_index: u64) -> Result<()> {
+    pub fn on_binlog_write(&self, binlog: &Binlog, raft_log_index: u64) -> Result<()> {
         let slot_id = binlog.slot_idx as usize;
         let instance_id = self.slot_indexer.get_instance_id(slot_id);
         let instance = &self.insts[instance_id];
@@ -459,6 +459,17 @@ impl Storage {
         }
 
         Box::new(batch).commit()?;
+
+        // Update collector with (log_index, seqno) mapping after successful commit
+        // This is critical for Raft snapshot integration: enables tracking which
+        // raft logs have been persisted to SST files
+        if let Some(ref db) = instance.db {
+            let seqno = db.latest_sequence_number();
+            if let Some(ref collector) = instance.logindex_collector {
+                collector.update(raft_log_index as i64, seqno);
+            }
+        }
+
         Ok(())
     }
 
@@ -500,5 +511,53 @@ impl Storage {
         } else {
             min_index
         }
+    }
+
+    /// Initialize cf_tracker from SST properties for all instances
+    ///
+    /// This should be called after restoring a snapshot to reinitialize
+    /// the cf_tracker with the actual state from the restored SST files.
+    pub fn init_cf_trackers(&self) -> crate::Result<()> {
+        for inst in &self.insts {
+            if let Some(ref cf_tracker) = inst.logindex_cf_tracker {
+                if let Some(ref db) = inst.db {
+                    // Get raw DB pointer from Engine trait object
+                    let engine = db.as_ref();
+                    // Use the engine's iterator_cf method to access CF handles
+                    // We need to get the raw DB to call cf_handle
+                    // For now, use a workaround: get properties via engine interface
+                    for cf_id in 0..crate::logindex::types::cf_metadata::COLUMN_FAMILY_COUNT {
+                        let cf_name = crate::logindex::types::cf_metadata::CF_NAMES_STR[cf_id];
+                        if let Some(cf) = engine.cf_handle(cf_name) {
+                            match engine.get_properties_of_all_tables_cf(&cf) {
+                                Ok(collection) => {
+                                    if let Some(pair) = crate::logindex::table_properties::get_largest_log_index_from_collection(&collection) {
+                                        let log_index = pair.applied_log_index();
+                                        let seqno = pair.seqno();
+                                        cf_tracker.set_flushed_log_index(cf_id, log_index, seqno);
+                                        // Note: applied_index should also be set, but requires additional tracking
+                                        // For snapshot restore, flushed_index == applied_index is a valid initial state
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to get properties for CF {}: {}", cf_name, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Get DB instance from first instance for cf_tracker initialization (snapshot restore)
+    ///
+    /// Returns None if storage is not opened or has no instances
+    pub fn db_instance(&self) -> Option<&dyn engine::Engine> {
+        self.insts
+            .first()
+            .and_then(|inst| inst.db.as_ref())
+            .map(|engine| engine.as_ref())
     }
 }

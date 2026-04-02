@@ -182,6 +182,7 @@ impl DualRuntimeError {
             StorageError::Unknown { .. } => false,
             StorageError::OptionNone { .. } => false,
             StorageError::RedisErr { .. } => true, // Redis protocol errors are typically recoverable
+            StorageError::LogIndex { .. } => true, // LogIndex errors are typically recoverable
         }
     }
 

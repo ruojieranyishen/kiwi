@@ -26,6 +26,7 @@ use openraft::storage::RaftStateMachine;
 use raft::state_machine::KiwiStateMachine;
 use storage::unique_test_db_path;
 use storage::{StorageOptions, storage::Storage};
+use storage::logindex::{LogIndexAndSequenceCollector, LogIndexOfColumnFamilies};
 
 #[tokio::test]
 async fn cursor_snapshot_roundtrip() -> anyhow::Result<()> {
@@ -44,11 +45,21 @@ async fn cursor_snapshot_roundtrip() -> anyhow::Result<()> {
 
     storage.set(b"k_l2", b"before")?;
 
+    // Initialize logindex collector and cf_tracker from storage
+    let collector = storage
+        .get_logindex_collector(0)
+        .unwrap_or_else(|| Arc::new(LogIndexAndSequenceCollector::new(0)));
+    let cf_tracker = storage
+        .get_logindex_cf_tracker(0)
+        .unwrap_or_else(|| Arc::new(LogIndexOfColumnFamilies::new()));
+
     let mut sm = KiwiStateMachine::new(
         1,
         Arc::clone(&storage),
         src_db_path.clone(),
         snap_root.clone(),
+        collector,
+        cf_tracker,
     );
 
     let mut builder = sm.get_snapshot_builder().await;
@@ -70,7 +81,19 @@ async fn cursor_snapshot_roundtrip() -> anyhow::Result<()> {
     // install_snapshot will restore the checkpoint directly to db_path, bypassing
     // the normal open flow. The storage is opened after install_snapshot completes.
     let target_storage = Arc::new(Storage::new(1, 0));
-    let mut sm2 = KiwiStateMachine::new(2, target_storage, restore_db_path.clone(), snap_root);
+
+    // Initialize logindex collector and cf_tracker for target state machine
+    let target_collector = Arc::new(LogIndexAndSequenceCollector::new(0));
+    let target_cf_tracker = Arc::new(LogIndexOfColumnFamilies::new());
+
+    let mut sm2 = KiwiStateMachine::new(
+        2,
+        target_storage,
+        restore_db_path.clone(),
+        snap_root,
+        target_collector,
+        target_cf_tracker,
+    );
     sm2.install_snapshot(&meta, Box::new(std::io::Cursor::new(bytes)))
         .await?;
 

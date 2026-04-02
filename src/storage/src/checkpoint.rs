@@ -17,9 +17,11 @@
 
 //! Raft snapshot checkpoint layout: one RocksDB checkpoint per DB instance plus `__raft_snapshot_meta`.
 
+use crate::logindex::LogIndexAndSequenceCollector;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,10 @@ pub struct RaftSnapshotMeta {
     pub last_included_index: u64,
     /// Last log term included in the snapshot
     pub last_included_term: u64,
+    /// LogIndex collector state: serialized (log_index, seqno) mappings
+    /// Format: list of "log_index:seqno" strings, sorted by log_index
+    #[serde(default)]
+    pub logindex_collector_state: Vec<String>,
 }
 
 impl RaftSnapshotMeta {
@@ -47,6 +53,32 @@ impl RaftSnapshotMeta {
             version: CURRENT_SNAPSHOT_VERSION,
             last_included_index,
             last_included_term,
+            logindex_collector_state: Vec::new(),
+        }
+    }
+
+    /// Create snapshot meta with collector state
+    pub fn with_collector_state(
+        last_included_index: u64,
+        last_included_term: u64,
+        collector: &Arc<LogIndexAndSequenceCollector>,
+    ) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+            logindex_collector_state: collector.export_state(),
+        }
+    }
+
+    /// Restore collector state from snapshot metadata
+    pub fn restore_collector_state(&self, collector: &Arc<LogIndexAndSequenceCollector>) {
+        for entry in &self.logindex_collector_state {
+            if let Some((log_index_str, seqno_str)) = entry.split_once(':') {
+                if let (Ok(log_index), Ok(seqno)) = (log_index_str.parse::<i64>(), seqno_str.parse::<u64>()) {
+                    collector.update(log_index, seqno);
+                }
+            }
         }
     }
 
