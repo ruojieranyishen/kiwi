@@ -35,6 +35,7 @@ use openraft::{
 };
 
 use conf::raft_type::{Binlog, BinlogResponse, KiwiNode, KiwiTypeConfig};
+use storage::logindex::{LogIndexAndSequenceCollector, LogIndexOfColumnFamilies};
 use storage::storage::Storage;
 use storage::{RaftSnapshotMeta, restore_checkpoint_layout};
 

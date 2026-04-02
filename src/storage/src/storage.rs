@@ -461,4 +461,44 @@ impl Storage {
         Box::new(batch).commit()?;
         Ok(())
     }
+
+    // ==================== LogIndex getters for Raft snapshot integration ====================
+
+    /// Get logindex collector for specified instance
+    pub fn get_logindex_collector(
+        &self,
+        instance_id: usize,
+    ) -> Option<Arc<crate::logindex::LogIndexAndSequenceCollector>> {
+        self.insts
+            .get(instance_id)
+            .and_then(|inst| inst.logindex_collector.clone())
+    }
+
+    /// Get logindex cf_tracker for specified instance
+    pub fn get_logindex_cf_tracker(
+        &self,
+        instance_id: usize,
+    ) -> Option<Arc<crate::logindex::LogIndexOfColumnFamilies>> {
+        self.insts
+            .get(instance_id)
+            .and_then(|inst| inst.logindex_cf_tracker.clone())
+    }
+
+    /// Get smallest applied log index across all CFs
+    pub fn get_smallest_applied_log_index(&self) -> i64 {
+        let mut min_index = i64::MAX;
+        for inst in &self.insts {
+            if let Some(ref tracker) = inst.logindex_cf_tracker {
+                let res = tracker.get_smallest_log_index(None);
+                if res.smallest_applied_log_index < min_index {
+                    min_index = res.smallest_applied_log_index;
+                }
+            }
+        }
+        if min_index == i64::MAX {
+            0
+        } else {
+            min_index
+        }
+    }
 }
