@@ -303,10 +303,10 @@ impl RaftStateMachine<KiwiTypeConfig> for KiwiStateMachine {
             )
         })?;
 
-        // Restore collector state from snapshot metadata
+        // Restore collector state from snapshot metadata for all instances
         // This is critical for logindex tracking: replays the (log_index, seqno) mappings
         // that were captured when the snapshot was created
-        file_meta.restore_collector_state(&self.collector);
+        file_meta.restore_to_storage(&self.storage);
 
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
@@ -361,11 +361,11 @@ impl RaftSnapshotBuilder<KiwiTypeConfig> for KiwiSnapshotBuilder {
             (0, 0)
         };
 
-        // Create snapshot meta with collector state for logindex tracking
-        let raft_meta = RaftSnapshotMeta::with_collector_state(
+        // Create snapshot meta with collector states for all instances
+        let raft_meta = RaftSnapshotMeta::with_all_instances(
             last_idx,
             last_term,
-            &self.collector,
+            &self._storage,
         );
 
         self._storage
