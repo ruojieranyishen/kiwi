@@ -232,3 +232,117 @@ fn test_raft_snapshot_meta_defaults_empty_states() {
     let parsed: RaftSnapshotMeta = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.logindex_collector_states.len(), 0);
 }
+
+/// Test with_all_instances aggregates collector states from multiple instances
+#[tokio::test]
+async fn test_with_all_instances_aggregates_multiple_collectors() {
+    let db_path = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut storage = Storage::new(3, 0);
+    let options = Arc::new(StorageOptions::default());
+    let _rx = storage.open(options, &db_path).unwrap();
+
+    // Update each instance's collector with different log_index
+    if let Some(c0) = storage.get_logindex_collector(0) {
+        c0.update(100, 1000);
+    }
+    if let Some(c1) = storage.get_logindex_collector(1) {
+        c1.update(200, 2000);
+    }
+    if let Some(c2) = storage.get_logindex_collector(2) {
+        c2.update(300, 3000);
+    }
+
+    // Create snapshot meta
+    let meta = RaftSnapshotMeta::with_all_instances(300, 1, &storage);
+
+    // Verify all 3 instance states captured
+    assert_eq!(meta.logindex_collector_states.len(), 3);
+    // Each instance should have one entry
+    assert!(!meta.logindex_collector_states[0].is_empty());
+    assert!(!meta.logindex_collector_states[1].is_empty());
+    assert!(!meta.logindex_collector_states[2].is_empty());
+}
+
+/// Test restore_to_storage restores all instances
+#[tokio::test]
+async fn test_restore_to_storage_restores_all_instances() {
+    let db_path = tempfile::tempdir().unwrap().path().to_path_buf();
+    let mut storage = Storage::new(3, 0);
+    let options = Arc::new(StorageOptions::default());
+    let _rx = storage.open(options, &db_path).unwrap();
+
+    // Create meta with states for all 3 instances
+    let meta = RaftSnapshotMeta {
+        version: 2,
+        last_included_index: 300,
+        last_included_term: 1,
+        logindex_collector_states: vec![
+            vec!["100:1000".to_string(), "150:1500".to_string()],
+            vec!["200:2000".to_string()],
+            vec!["300:3000".to_string()],
+        ],
+    };
+
+    // Restore
+    meta.restore_to_storage(&storage);
+
+    // Verify each instance's collector has correct state
+    if let Some(c0) = storage.get_logindex_collector(0) {
+        assert_eq!(c0.find_applied_log_index(1000), 100);
+        assert_eq!(c0.find_applied_log_index(1500), 150);
+    }
+    if let Some(c1) = storage.get_logindex_collector(1) {
+        assert_eq!(c1.find_applied_log_index(2000), 200);
+    }
+    if let Some(c2) = storage.get_logindex_collector(2) {
+        assert_eq!(c2.find_applied_log_index(3000), 300);
+    }
+}
+
+/// Test backward compatibility: v1 format (single Vec<String>) should be migratable via from_v1
+#[test]
+fn test_from_v1_backward_compatibility() {
+    // Create v1-style single instance state
+    let single_state = vec!["100:1000".to_string(), "200:2000".to_string()];
+
+    // Convert to v2 format using from_v1
+    let meta = RaftSnapshotMeta::from_v1(200, 1, single_state);
+
+    // Verify conversion
+    assert_eq!(meta.version, 2);
+    assert_eq!(meta.last_included_index, 200);
+    assert_eq!(meta.last_included_term, 1);
+    assert_eq!(meta.logindex_collector_states.len(), 1);
+    assert_eq!(meta.logindex_collector_states[0].len(), 2);
+    assert_eq!(meta.logindex_collector_states[0][0], "100:1000");
+    assert_eq!(meta.logindex_collector_states[0][1], "200:2000");
+}
+
+/// Test that v1 JSON can be read and converted via read_v1_from_dir
+#[test]
+fn test_read_v1_snapshot() {
+    use std::fs;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let meta_path = tmp_dir.path().join("__raft_snapshot_meta");
+
+    // Write v1 format JSON (single instance state as flat Vec<String>)
+    let v1_json = r#"{
+        "version": 1,
+        "last_included_index": 200,
+        "last_included_term": 1,
+        "logindex_collector_state": ["100:1000", "200:2000"]
+    }"#;
+    fs::write(&meta_path, v1_json).unwrap();
+
+    // read_from_dir should now handle v1 gracefully via read_v1_from_dir
+    let result = RaftSnapshotMeta::read_from_dir(tmp_dir.path());
+    assert!(result.is_ok(), "Should successfully read v1 format snapshot");
+
+    let meta = result.unwrap();
+    assert_eq!(meta.version, 2); // Converted to v2 internally
+    assert_eq!(meta.last_included_index, 200);
+    assert_eq!(meta.last_included_term, 1);
+    assert_eq!(meta.logindex_collector_states.len(), 1);
+    assert_eq!(meta.logindex_collector_states[0].len(), 2);
+}

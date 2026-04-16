@@ -18,6 +18,7 @@
 //! Raft snapshot checkpoint layout: one RocksDB checkpoint per DB instance plus `__raft_snapshot_meta`.
 
 use crate::logindex::LogIndexAndSequenceCollector;
+use crate::storage::Storage;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -30,6 +31,29 @@ pub const RAFT_SNAPSHOT_META_FILE: &str = "__raft_snapshot_meta";
 
 /// Current snapshot format version
 pub const CURRENT_SNAPSHOT_VERSION: u32 = 2;
+
+/// V1 snapshot format for backward compatibility deserialization
+/// V1 format uses single Vec<String> for collector state (single instance)
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct V1RaftSnapshotMeta {
+    version: u32,
+    last_included_index: u64,
+    last_included_term: u64,
+    #[serde(default, alias = "logindex_collector_states")]
+    logindex_collector_state: Vec<String>,
+}
+
+impl From<V1RaftSnapshotMeta> for RaftSnapshotMeta {
+    fn from(v1: V1RaftSnapshotMeta) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index: v1.last_included_index,
+            last_included_term: v1.last_included_term,
+            logindex_collector_states: vec![v1.logindex_collector_state],
+        }
+    }
+}
 
 /// Metadata persisted next to per-instance checkpoint directories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +108,68 @@ impl RaftSnapshotMeta {
             last_included_index,
             last_included_term,
             logindex_collector_states: collector_states,
+        }
+    }
+
+    /// Create snapshot meta with all instance collector states from Storage.
+    /// This is the primary method for multi-instance snapshot creation.
+    pub fn with_all_instances(
+        last_included_index: u64,
+        last_included_term: u64,
+        storage: &Storage,
+    ) -> Self {
+        let states: Vec<Vec<String>> = (0..storage.db_instance_num)
+            .map(|instance_id| {
+                storage
+                    .get_logindex_collector(instance_id)
+                    .map(|c| c.export_state())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+            logindex_collector_states: states,
+        }
+    }
+
+    /// Restore collector state for all instances in Storage.
+    /// This is the primary method for multi-instance snapshot restore.
+    pub fn restore_to_storage(&self, storage: &Storage) {
+        for (instance_id, state) in self.logindex_collector_states.iter().enumerate() {
+            if let Some(collector) = storage.get_logindex_collector(instance_id) {
+                self.restore_instance_state(&collector, state);
+            }
+        }
+    }
+
+    /// Restore single instance collector state (internal helper)
+    fn restore_instance_state(&self, collector: &Arc<LogIndexAndSequenceCollector>, state: &[String]) {
+        for entry in state {
+            if let Some((log_index_str, seqno_str)) = entry.split_once(':') {
+                if let (Ok(log_index), Ok(seqno)) =
+                    (log_index_str.parse::<i64>(), seqno_str.parse::<u64>())
+                {
+                    collector.update(log_index, seqno);
+                }
+            }
+        }
+    }
+
+    /// Backward compatibility: convert v1 format (single instance) to v2.
+    /// Use this when migrating from v1 snapshots to multi-instance format.
+    pub fn from_v1(
+        last_included_index: u64,
+        last_included_term: u64,
+        single_state: Vec<String>,
+    ) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+            logindex_collector_states: vec![single_state], // Instance 0 only
         }
     }
 
@@ -153,21 +239,34 @@ impl RaftSnapshotMeta {
     pub fn read_from_dir(dir: &Path) -> io::Result<Self> {
         let path = dir.join(RAFT_SNAPSHOT_META_FILE);
         let bytes = fs::read(path)?;
-        let meta: Self = serde_json::from_slice(&bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // Validate version
-        if meta.version < CURRENT_SNAPSHOT_VERSION {
-            return Err(io::Error::new(
+        // First, try to detect version by peeking at the JSON
+        let peeked: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let version = peeked
+            .get("version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Handle different versions
+        match version {
+            0 => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported snapshot version: {}, expected >= {}",
-                    meta.version, CURRENT_SNAPSHOT_VERSION
-                ),
-            ));
+                "snapshot missing version field",
+            )),
+            1 => {
+                // V1 format: single instance, Vec<String>
+                let v1_meta: V1RaftSnapshotMeta = serde_json::from_slice(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(v1_meta.into())
+            }
+            2.. => {
+                // V2+ format: multi-instance, Vec<Vec<String>>
+                let meta: Self = serde_json::from_slice(&bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                Ok(meta)
+            }
         }
-
-        Ok(meta)
     }
 }
 
