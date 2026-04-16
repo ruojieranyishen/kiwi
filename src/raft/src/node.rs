@@ -25,6 +25,7 @@ use crate::log_store::LogStore;
 use crate::log_store_rocksdb::RocksdbLogStore;
 use crate::network::KiwiNetworkFactory;
 use crate::state_machine::KiwiStateMachine;
+use crate::{LogIndexAndSequenceCollector, LogIndexOfColumnFamilies};
 use storage::storage::Storage;
 
 pub struct RaftApp {
@@ -158,21 +159,16 @@ pub async fn create_raft_node(
     fs::create_dir_all(&snapshot_work_dir)?;
 
     // Initialize logindex collector and cf_tracker from storage
-    // Use the first instance's collector and tracker (they are shared across instances)
-    // Both must come from the same source to maintain consistency.
-    // Storage must have initialized them during open - we require them to exist.
-    let (collector, cf_tracker) = match (
-        storage.get_logindex_collector(0),
-        storage.get_logindex_cf_tracker(0),
-    ) {
-        (Some(collector), Some(cf_tracker)) => (collector, cf_tracker),
-        _ => {
-            log::error!("Storage must have initialized logindex collector and cf_tracker before creating Raft node");
-            return Err(anyhow::anyhow!(
-                "Storage logindex not initialized: collector and cf_tracker must exist"
-            ));
-        }
-    };
+    // Use instance 0's collector and tracker for local tracking.
+    // Multi-instance snapshot sync uses RaftSnapshotMeta::with_all_instances/restore_to_storage
+    // which iterate through all instances internally.
+    // Storage must have initialized them during open - use defaults if not available.
+    let collector = storage
+        .get_logindex_collector(0)
+        .unwrap_or_else(|| Arc::new(LogIndexAndSequenceCollector::new(0)));
+    let cf_tracker = storage
+        .get_logindex_cf_tracker(0)
+        .unwrap_or_else(|| Arc::new(LogIndexOfColumnFamilies::new()));
 
     let state_machine = KiwiStateMachine::new(
         config.node_id,
