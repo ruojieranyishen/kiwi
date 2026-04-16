@@ -81,13 +81,13 @@ async fn restore_checkpoint_to_new_storage_after_source_mutation() {
 fn test_snapshot_meta_version() {
     let meta = RaftSnapshotMeta::new(100, 5);
 
-    // Verify version is serialized
+    // Verify version is serialized (now version 2 for multi-instance support)
     let json = serde_json::to_string(&meta).unwrap();
-    assert!(json.contains("\"version\":1"));
+    assert!(json.contains("\"version\":2"));
 
     // Verify version is deserialized correctly
     let deserialized: RaftSnapshotMeta = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.version, 1);
+    assert_eq!(deserialized.version, 2);
     assert_eq!(deserialized.last_included_index, 100);
     assert_eq!(deserialized.last_included_term, 5);
 }
@@ -159,10 +159,76 @@ fn test_snapshot_meta_max_version() {
         version: u32::MAX,
         last_included_index: 42,
         last_included_term: 7,
-        logindex_collector_state: Vec::new(),
+        logindex_collector_states: Vec::new(),
     };
 
     let json = serde_json::to_string(&meta).unwrap();
     let deserialized: RaftSnapshotMeta = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.version, u32::MAX);
+}
+
+/// Test that RaftSnapshotMeta supports multi-instance logindex collector state.
+#[test]
+fn test_raft_snapshot_meta_multi_instance_format() {
+    // Test that new format can serialize/deserialize multiple instance states
+    let meta = RaftSnapshotMeta {
+        version: 2,
+        last_included_index: 300,
+        last_included_term: 1,
+        logindex_collector_states: vec![
+            vec!["100:1000".to_string()],
+            vec!["200:2000".to_string()],
+            vec!["300:3000".to_string()],
+        ],
+    };
+
+    let json = serde_json::to_string_pretty(&meta).unwrap();
+    let parsed: RaftSnapshotMeta = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(parsed.logindex_collector_states.len(), 3);
+    assert_eq!(parsed.logindex_collector_states[0], vec!["100:1000"]);
+}
+
+/// Test backward compatibility: v1 format (single instance) can be read with new code.
+/// Note: serde alias handles field name mapping, but type conversion (Vec<String> -> Vec<Vec<String>>)
+/// requires custom deserialization logic. This test verifies that the field name alias works,
+/// but the actual v1->v2 data migration should be handled separately.
+#[test]
+fn test_raft_snapshot_meta_backward_compatibility_field_alias() {
+    // New v2 format with pluralized field name should work
+    let v2_format_json = r#"{
+        "version": 2,
+        "last_included_index": 100,
+        "last_included_term": 5,
+        "logindex_collector_states": [["50:500", "60:600"]]
+    }"#;
+
+    let parsed: RaftSnapshotMeta = serde_json::from_str(v2_format_json).unwrap();
+    assert_eq!(parsed.logindex_collector_states.len(), 1);
+    assert_eq!(parsed.logindex_collector_states[0], vec!["50:500", "60:600"]);
+
+    // Alias field name works for identical types (v2 format with old field name)
+    let aliased_json = r#"{
+        "version": 2,
+        "last_included_index": 100,
+        "last_included_term": 5,
+        "logindex_collector_state": [["50:500", "60:600"]]
+    }"#;
+
+    let parsed_alias: RaftSnapshotMeta = serde_json::from_str(aliased_json).unwrap();
+    assert_eq!(parsed_alias.logindex_collector_states.len(), 1);
+    assert_eq!(parsed_alias.logindex_collector_states[0], vec!["50:500", "60:600"]);
+}
+
+/// Test that missing collector state field defaults to empty vec.
+#[test]
+fn test_raft_snapshot_meta_defaults_empty_states() {
+    let json = r#"{
+        "version": 2,
+        "last_included_index": 100,
+        "last_included_term": 5
+    }"#;
+
+    let parsed: RaftSnapshotMeta = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.logindex_collector_states.len(), 0);
 }

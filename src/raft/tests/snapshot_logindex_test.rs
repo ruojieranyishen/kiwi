@@ -242,13 +242,20 @@ async fn test_collector_state_export_restore() -> anyhow::Result<()> {
         &collector,
     );
 
-    assert_eq!(meta.logindex_collector_state.len(), 3);
-    assert!(meta.logindex_collector_state.contains(&"100:1000".to_string()));
-    assert!(meta.logindex_collector_state.contains(&"200:2000".to_string()));
-    assert!(meta.logindex_collector_state.contains(&"300:3000".to_string()));
+    // Verify collector state is stored (using backward-compatible accessor)
+    let state = meta.logindex_collector_state();
+    assert_eq!(state.len(), 3);
+    assert!(state.contains(&"100:1000".to_string()));
+    assert!(state.contains(&"200:2000".to_string()));
+    assert!(state.contains(&"300:3000".to_string()));
 
-    // Create a new collector and restore state
+    // Verify multi-instance state storage
+    assert_eq!(meta.logindex_collector_states.len(), 1);
+    assert_eq!(meta.logindex_collector_states[0].len(), 3);
+
+    // Create a new collector and restore state (backward-compatible method)
     let new_collector = Arc::new(LogIndexAndSequenceCollector::new(0));
+    #[allow(deprecated)]
     meta.restore_collector_state(&new_collector);
 
     // Verify restored state

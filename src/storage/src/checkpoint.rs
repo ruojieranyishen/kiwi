@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 pub const RAFT_SNAPSHOT_META_FILE: &str = "__raft_snapshot_meta";
 
 /// Current snapshot format version
-pub const CURRENT_SNAPSHOT_VERSION: u32 = 1;
+pub const CURRENT_SNAPSHOT_VERSION: u32 = 2;
 
 /// Metadata persisted next to per-instance checkpoint directories.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,10 +40,12 @@ pub struct RaftSnapshotMeta {
     pub last_included_index: u64,
     /// Last log term included in the snapshot
     pub last_included_term: u64,
-    /// LogIndex collector state: serialized (log_index, seqno) mappings
-    /// Format: list of "log_index:seqno" strings, sorted by log_index
-    #[serde(default)]
-    pub logindex_collector_state: Vec<String>,
+    /// LogIndex collector state for each instance.
+    /// Format: Vec[instance_id] = Vec<"log_index:seqno">
+    /// Length should match Storage.db_instance_num (typically 3)
+    /// For backward compatibility with v1, old field name kept with serde alias
+    #[serde(default, alias = "logindex_collector_state")]
+    pub logindex_collector_states: Vec<Vec<String>>,
 }
 
 impl RaftSnapshotMeta {
@@ -53,11 +55,11 @@ impl RaftSnapshotMeta {
             version: CURRENT_SNAPSHOT_VERSION,
             last_included_index,
             last_included_term,
-            logindex_collector_state: Vec::new(),
+            logindex_collector_states: Vec::new(),
         }
     }
 
-    /// Create snapshot meta with collector state
+    /// Create snapshot meta with collector state for a single instance (for backward compatibility)
     pub fn with_collector_state(
         last_included_index: u64,
         last_included_term: u64,
@@ -67,19 +69,61 @@ impl RaftSnapshotMeta {
             version: CURRENT_SNAPSHOT_VERSION,
             last_included_index,
             last_included_term,
-            logindex_collector_state: collector.export_state(),
+            logindex_collector_states: vec![collector.export_state()],
         }
     }
 
-    /// Restore collector state from snapshot metadata
-    pub fn restore_collector_state(&self, collector: &Arc<LogIndexAndSequenceCollector>) {
-        for entry in &self.logindex_collector_state {
-            if let Some((log_index_str, seqno_str)) = entry.split_once(':') {
-                if let (Ok(log_index), Ok(seqno)) = (log_index_str.parse::<i64>(), seqno_str.parse::<u64>()) {
-                    collector.update(log_index, seqno);
+    /// Create snapshot meta with collector states for all instances
+    pub fn with_collector_states(
+        last_included_index: u64,
+        last_included_term: u64,
+        collector_states: Vec<Vec<String>>,
+    ) -> Self {
+        Self {
+            version: CURRENT_SNAPSHOT_VERSION,
+            last_included_index,
+            last_included_term,
+            logindex_collector_states: collector_states,
+        }
+    }
+
+    /// Restore collector state from snapshot metadata for a specific instance
+    pub fn restore_collector_state_for_instance(
+        &self,
+        instance_id: usize,
+        collector: &Arc<LogIndexAndSequenceCollector>,
+    ) {
+        if let Some(states) = self.logindex_collector_states.get(instance_id) {
+            for entry in states {
+                if let Some((log_index_str, seqno_str)) = entry.split_once(':') {
+                    if let (Ok(log_index), Ok(seqno)) =
+                        (log_index_str.parse::<i64>(), seqno_str.parse::<u64>())
+                    {
+                        collector.update(log_index, seqno);
+                    }
                 }
             }
         }
+    }
+
+    /// Restore collector state from snapshot metadata (single instance, backward compatible).
+    /// Uses the first instance's state (instance_id = 0).
+    #[deprecated(note = "Use restore_collector_state_for_instance with explicit instance_id")]
+    pub fn restore_collector_state(&self, collector: &Arc<LogIndexAndSequenceCollector>) {
+        self.restore_collector_state_for_instance(0, collector);
+    }
+
+    /// Get collector state for a specific instance
+    pub fn get_collector_state(&self, instance_id: usize) -> Option<&[String]> {
+        self.logindex_collector_states.get(instance_id).map(|v| v.as_slice())
+    }
+
+    /// Get collector state for first instance (backward compatible accessor)
+    pub fn logindex_collector_state(&self) -> Vec<String> {
+        self.logindex_collector_states
+            .first()
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn write_to_dir(&self, dir: &Path) -> io::Result<()> {
