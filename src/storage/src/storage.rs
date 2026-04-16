@@ -513,6 +513,24 @@ impl Storage {
         }
     }
 
+    /// Get smallest flushed log index across all instances
+    /// This is the safe upper bound for Raft log purge - we can only
+    /// purge logs that have been flushed in ALL instances.
+    pub fn get_global_smallest_flushed_log_index(&self) -> i64 {
+        let mut min_index = i64::MAX;
+
+        for inst in &self.insts {
+            if let Some(ref tracker) = inst.logindex_cf_tracker {
+                let res = tracker.get_smallest_log_index(None);
+                if res.smallest_flushed_log_index < min_index {
+                    min_index = res.smallest_flushed_log_index;
+                }
+            }
+        }
+
+        if min_index == i64::MAX { 0 } else { min_index }
+    }
+
     /// Initialize cf_tracker from SST properties for all instances
     ///
     /// This should be called after restoring a snapshot to reinitialize
